@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <title>Testing Psirver</title>
+  </head>
+
+  <body>
+    
+    <h2>Submit Data using GET</h2>
+    <a href="http://localhost:8000/health">Click on me!</a>
+  
+    <h2>Submit Data using POST</h2>
+    
+    <form action="http://localhost:8000/jobs" method="POST">      
+        <label>Arguments (a comma-separated list):</label>        
+        <input type="text" id="args" name="args" required>        
+        <input type="submit" value="Submit">
+    </form>
+
+    <h2>Upload file using POST</h2>
+    <form action="http://localhost:8000/scripts" method="POST" enctype='multipart/form-data'>      
+    <input type="file" id="script" name="script" />
+    <input type="submit" value="Submit">
+    </form>
+
+  </body>
+</html>
