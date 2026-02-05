@@ -1,116 +1,43 @@
-#include <cstdlib>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <syslog.h>
-#include <cerrno>
-#include <cstring>
 #include <fcntl.h>
-#include <sys/stat.h>
-#include <csignal>
-#include <limits.h>
-#include <iostream>
+#include <netinet/in.h>
+#include <string>
+#include <syslog.h> 
+#include <unistd.h>
 
-#include "Requests.hh"
+#include "utils.hh"
+#include "Tasks.hh"
 
 // Configuration options and other constants
-static constexpr uint16_t DEFAULT_PORT = 8000;
 static constexpr ssize_t MAX_REQUEST_SZ = 0x10000;
-static constexpr size_t BUFFER_SZ = 4096;
-static constexpr char HEADER_END[] = "\r\n\r\n";
 
-// Global server socket
-int server_socket = -1;
-static char pid_file_path[PATH_MAX];
-static volatile sig_atomic_t shutdown_requested = 0;
+static constexpr size_t READ_BUFFER_SZ = 0x1000;
+static constexpr char RN[] = "\r\n";
+static constexpr char END_OF_HEADER[] = "\r\n\r\n";
+
+// Global variables (are evil)
+int server_socket;
+std::string pid_path;
 
 // Reply to the client with an HTTP status line and a human-readable
-// response body
+// response body. Library functions used:
+// - std::to_string()
 void reply(int client, const char *status_line, const char *body)
 {
   std::string headers;
   headers.reserve(256);
   headers.append(status_line);
-  headers.append("\r\n");
-  headers.append("Content-Type: text/plain; charset=utf-8\r\n");
+  headers.append(RN);
+  headers.append("Content-Type: text/plain; charset=utf-8");
+  headers.append(RN);
   headers.append("Content-Length: ");
   headers.append(std::to_string(strlen(body)));
-  headers.append("\r\n");
+  headers.append(RN);
   headers.append("Connection: close");
-  headers.append(HEADER_END);
+  headers.append(END_OF_HEADER);
 
   write(client, headers.data(), headers.size());
   write(client, body, strlen(body));
   close(client);
-}
-
-// Log an error message with the current errno details
-void log_error(const char *context)
-{
-  syslog(LOG_ERR, "%s: %s", context, strerror(errno));
-}
-
-void print_usage(const char *program, const char *message)
-{
-  if (message != nullptr) {
-    std::cerr << message << std::endl;
-  }
-  std::cerr << "Usage: " << program << " [port]" << std::endl;
-}
-
-bool create_pid_file()
-{
-  const char *psirver_home = std::getenv("PSIRVER_HOME");
-  if (psirver_home == nullptr || *psirver_home == '\0') {
-    std::cerr << "Error: PSIRVER_HOME is not set." << std::endl;
-    return false;
-  }
-
-  struct stat st;
-  if (stat(psirver_home, &st) != 0 || !S_ISDIR(st.st_mode)) {
-    std::cerr << "Error: PSIRVER_HOME directory does not exist." << std::endl;
-    return false;
-  }
-
-  std::string pid_path = std::string(psirver_home) + "/psirver.pid";
-  if (pid_path.size() >= sizeof(pid_file_path)) {
-    std::cerr << "Error: PSIRVER_HOME path is too long." << std::endl;
-    return false;
-  }
-  std::strncpy(pid_file_path, pid_path.c_str(), sizeof(pid_file_path));
-  pid_file_path[sizeof(pid_file_path) - 1] = '\0';
-
-  int fd = open(pid_file_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  if (fd < 0) {
-    std::cerr << "Error: could not create PID file." << std::endl;
-    return false;
-  }
-
-  std::string pid_text = std::to_string(getpid());
-  ssize_t written = write(fd, pid_text.c_str(), pid_text.size());
-  close(fd);
-  if (written < 0 || static_cast<size_t>(written) != pid_text.size()) {
-    std::cerr << "Error: could not write PID file." << std::endl;
-    return false;
-  }
-
-  return true;
-}
-
-void handle_sigint(int)
-{
-  shutdown_requested = 1;
-  if (server_socket >= 0) {
-    close(server_socket);
-  }
-}
-
-void remove_pid_file()
-{
-  if (pid_file_path[0] != '\0') {
-    unlink(pid_file_path);
-  }
 }
 
 // Open the main server socket and prepare it for accepting
@@ -125,7 +52,7 @@ int init_socket(uint16_t port)
 {
   server_socket = socket(AF_INET, SOCK_STREAM, 0);
   if (server_socket < 0) {
-    log_error("socket failed");
+    syslog(LOG_ERR, "Socket: %s", strerror(errno));
     return -1;
   }
     
@@ -136,20 +63,20 @@ int init_socket(uint16_t port)
 
   if (bind(server_socket, reinterpret_cast<sockaddr *>(&server_addr),
 	   sizeof(server_addr)) < 0) {
-    log_error("bind failed");
+    syslog(LOG_ERR, "Bind: %s", strerror(errno));
     close(server_socket);
     return -1;
   }
   
   if (listen(server_socket, SOMAXCONN) != 0) {
-    log_error("listen failed");
+    syslog(LOG_ERR, "Listen: %s", strerror(errno));
     close(server_socket);
     return -1;
   }
 
   // Prevent leaking server_socket into child processes
   if(-1 == fcntl(server_socket, F_SETFD, FD_CLOEXEC)) {
-    log_error("fcntl(FD_CLOEXEC) failed");
+    syslog(LOG_WARNING, "fcntl: %s", strerror(errno));
   }
   
   return 0;
@@ -157,14 +84,14 @@ int init_socket(uint16_t port)
 
 // Given the headers, extract the context length (only for
 // POST). Library functions used:
-// - none
+// - std::stoi()
 
-ssize_t parse_content_length(int client, std::string headers)
+static ssize_t parse_content_length(int client, std::string headers)
 {
   constexpr char CL[] = "Content-Length: ";
   size_t pos = headers.find(CL);
   if (pos == std::string::npos) {
-    reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
+    reply(client, "HTTP/1.1 411 Length Required", "Length Required");
     return -1;
   }
   
@@ -194,7 +121,7 @@ std::string read_body(int client, ssize_t content_length, std::string body)
 {
   size_t remaining = content_length - body.length();
   
-  char buffer[BUFFER_SZ];
+  char buffer[READ_BUFFER_SZ];
   while (remaining > 0) {
     ssize_t read_len = std::min((ssize_t)remaining, (ssize_t)sizeof(buffer));
     ssize_t chunk_sz = read(client, buffer, read_len);
@@ -207,28 +134,23 @@ std::string read_body(int client, ssize_t content_length, std::string body)
 }
 
 // Accept a connection, read the request, parse the headers and the
-// body (for POST). The function returns 0 on success and -1 on
-// failure. Library functions used:
+// body (for POST). The function returns a new Task on success and
+// nullptr on failure. Library functions used:
 // - accept()
 // - read()
-int process_request()
+
+Task *request2task()
 {
-  if (shutdown_requested) {
-    return 0;
-  }
   struct sockaddr_in client_addr;
   socklen_t addrlen = sizeof client_addr;
 
   int client = accept(server_socket, (struct sockaddr *)&client_addr, &addrlen);
   if(client < 0) {
-    if (shutdown_requested || errno == EINTR || errno == EBADF) {
-      return 0;
-    }
-    log_error("accept failed");
-    return -1;
+    syslog(LOG_ERR, "Accept: %s", strerror(errno));
+    return nullptr;
   }
   
-  char buffer[BUFFER_SZ]; 
+  char buffer[READ_BUFFER_SZ]; 
   size_t header_end_pos = std::string::npos;
   ssize_t chunk_sz;
   
@@ -239,7 +161,7 @@ int process_request()
   while (request.size() < MAX_REQUEST_SZ &&
 	 (chunk_sz = read(client, buffer, sizeof(buffer))) > 0) {
     request.append(buffer, chunk_sz);
-    header_end_pos = request.find(HEADER_END);
+    header_end_pos = request.find(END_OF_HEADER);
     if (header_end_pos != std::string::npos) {
       break;
     }
@@ -247,22 +169,17 @@ int process_request()
   
   if (request.size() > MAX_REQUEST_SZ) {
     reply(client, "HTTP/1.1 413 Content Too Large", "Content Too Large");
-    return -1;
+    return nullptr;
   }
   
   if(request.compare(0, strlen("GET "), "GET ") == 0) {
     std::string headers = request.substr(0, header_end_pos);
 
-    Request *rq = Request::make_get_request(headers);
-    /*
-    if(rq == nullptr) {
-      reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
-      return -1;
-    }
-    */
-    
+    Task *task = Task::construct(client, headers);
+
+    // TODO: move messaging to execute()
     reply(client, "HTTP/1.1 200 OK", "Hello from Psirver!");
-    return 0;
+    return task;
   }
 
   if(request.compare(0, strlen("POST "), "POST ") == 0) {
@@ -271,97 +188,66 @@ int process_request()
     ssize_t content_length = parse_content_length(client, headers);
       
     if (content_length < 0) {
-      return -1;
+      return nullptr;
     }
 
-    std::string body = request.substr(header_end_pos + sizeof HEADER_END - 1);
+    std::string body = request.substr(header_end_pos + sizeof END_OF_HEADER - 1);
     body = read_body(client, content_length, body);
 
-    Request *rq = Request::make_post_request(headers, body);
-    /*
-    if(rq == nullptr) {
-      reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
-      return -1;
-    }
-    */
-    
+    Task *task = Task::construct(client, headers, body);    
+    // TODO: move messaging to execute()
     reply(client, "HTTP/1.1 200 OK", "Hello from Psirver!");
-    return 0;
+    return task;
   }
   
   reply(client, "HTTP/1.1 405 Method Not Allowed",
-	(request.substr(0, 10) + "...").c_str());
-  return -1;
+	(request.substr(0, 0x10) + "...").c_str());
+  return nullptr;
+}
+
+// SIGINT handler. Will cause a graceful shutdown. Library functions used:
+// - close()
+// - unlink()
+// - syslog()
+// - exit()
+void on_sigint(int /* sig_num */)
+{
+  close(server_socket);
+  if (unlink(pid_path.c_str()) != 0) {
+    syslog(LOG_WARNING, "Unlink(%s): %s", pid_path.c_str(), strerror(errno));
+  }
+  syslog(LOG_USER, "Terminated.");
+  exit(EXIT_SUCCESS);
 }
 
 // The main workhorse. Library functions used:
-// - close()
+// - none
 int main(int argc, char **argv)
 {
+  // Select the server port
+  uint16_t server_port = select_port(argc, argv);
 
-  // --> TODO If command-line parameter is provided, treat it as the
-  // --> port number. (Make sure it is != 0.) Otherwise, use the
-  // --> default port number.
-  uint16_t port = DEFAULT_PORT;
-  if (argc > 2) {
-    print_usage(argv[0], "Error: too many arguments.");
+  // Initialize the server socket
+  if(init_socket(server_port) < 0 || server_socket < 0) {
     return EXIT_FAILURE;
   }
 
-  if (argc == 1) {
-    port = DEFAULT_PORT;
-  } else if (argc == 2) {
-    const char *port_str = argv[1];
-    if (port_str == nullptr || *port_str == '\0') {
-      print_usage(argv[0], "Error: port must be a positive integer.");
-      return EXIT_FAILURE;
-    }
-
-    errno = 0;
-    char *end = nullptr;
-    unsigned long parsed = std::strtoul(port_str, &end, 10);
-    if (errno != 0 || end == port_str || *end != '\0' || parsed == 0 || parsed > 65535) {
-      print_usage(argv[0], "Error: port must be a positive integer.");
-      return EXIT_FAILURE;
-    }
-
-    port = static_cast<uint16_t>(parsed);
-  }
+  // Create $(PSIRVER_HOME)/psirver.pid
+  pid_path = init_pid_file();
   
-  // --> TODO Insert code here that creates
-  // --> $(PSIRVER_HOME)/psirver.pid
-  if (!create_pid_file()) {
-    return EXIT_FAILURE;
-  }
-
-  // --> TODO Insert code here that registers a graceful shutdown
-  // --> handler on SIGINT
-  struct sigaction sa{};
-  sa.sa_handler = handle_sigint;
-  sigemptyset(&sa.sa_mask);
-  sa.sa_flags = 0;
-  sigaction(SIGINT, &sa, nullptr);
-  sigaction(SIGTERM, &sa, nullptr);
-
-  init_socket(port);
-  if(server_socket < 0) {
-    return EXIT_FAILURE;
-  }
-    
+  // Register a graceful shutdown handler on SIGINT
+  add_sigint_handler();
+  
+  // The main loop
   while(true) { // Not really, but close
-    if (shutdown_requested) {
-      break;
-    }
-    process_request();
-    if (shutdown_requested) {
-      break;
+    Task *task = request2task();
+    
+    // Main processing will happen here, but now all tasks are nullptrs
+    if (task) {
+      task->execute();
+      delete task;
     }
   }
 
-  if (server_socket >= 0) {
-    close(server_socket);
-  }
-  syslog(LOG_NOTICE, "Psirver shutting down on SIGINT");
-  remove_pid_file();
   return EXIT_SUCCESS;
 }

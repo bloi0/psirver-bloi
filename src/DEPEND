@@ -1,2 +1,0 @@
-Requests.o: Requests.cc Requests.hh
-psirver.o: psirver.cc Requests.hh
