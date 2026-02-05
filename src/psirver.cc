@@ -3,8 +3,14 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <syslog.h> 
+#include <syslog.h>
+#include <cerrno>
+#include <cstring>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <csignal>
+#include <limits.h>
+#include <iostream>
 
 #include "Requests.hh"
 
@@ -15,7 +21,9 @@ static constexpr size_t BUFFER_SZ = 4096;
 static constexpr char HEADER_END[] = "\r\n\r\n";
 
 // Global server socket
-int server_socket;
+int server_socket = -1;
+static char pid_file_path[PATH_MAX];
+static volatile sig_atomic_t shutdown_requested = 0;
 
 // Reply to the client with an HTTP status line and a human-readable
 // response body
@@ -37,6 +45,74 @@ void reply(int client, const char *status_line, const char *body)
   close(client);
 }
 
+// Log an error message with the current errno details
+void log_error(const char *context)
+{
+  syslog(LOG_ERR, "%s: %s", context, strerror(errno));
+}
+
+void print_usage(const char *program, const char *message)
+{
+  if (message != nullptr) {
+    std::cerr << message << std::endl;
+  }
+  std::cerr << "Usage: " << program << " [port]" << std::endl;
+}
+
+bool create_pid_file()
+{
+  const char *psirver_home = std::getenv("PSIRVER_HOME");
+  if (psirver_home == nullptr || *psirver_home == '\0') {
+    std::cerr << "Error: PSIRVER_HOME is not set." << std::endl;
+    return false;
+  }
+
+  struct stat st;
+  if (stat(psirver_home, &st) != 0 || !S_ISDIR(st.st_mode)) {
+    std::cerr << "Error: PSIRVER_HOME directory does not exist." << std::endl;
+    return false;
+  }
+
+  std::string pid_path = std::string(psirver_home) + "/psirver.pid";
+  if (pid_path.size() >= sizeof(pid_file_path)) {
+    std::cerr << "Error: PSIRVER_HOME path is too long." << std::endl;
+    return false;
+  }
+  std::strncpy(pid_file_path, pid_path.c_str(), sizeof(pid_file_path));
+  pid_file_path[sizeof(pid_file_path) - 1] = '\0';
+
+  int fd = open(pid_file_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) {
+    std::cerr << "Error: could not create PID file." << std::endl;
+    return false;
+  }
+
+  std::string pid_text = std::to_string(getpid());
+  ssize_t written = write(fd, pid_text.c_str(), pid_text.size());
+  close(fd);
+  if (written < 0 || static_cast<size_t>(written) != pid_text.size()) {
+    std::cerr << "Error: could not write PID file." << std::endl;
+    return false;
+  }
+
+  return true;
+}
+
+void handle_sigint(int)
+{
+  shutdown_requested = 1;
+  if (server_socket >= 0) {
+    close(server_socket);
+  }
+}
+
+void remove_pid_file()
+{
+  if (pid_file_path[0] != '\0') {
+    unlink(pid_file_path);
+  }
+}
+
 // Open the main server socket and prepare it for accepting
 // connections. Library functions used:
 // - htonl()/htons()
@@ -49,7 +125,7 @@ int init_socket(uint16_t port)
 {
   server_socket = socket(AF_INET, SOCK_STREAM, 0);
   if (server_socket < 0) {
-    // --> TODO Call syslog here
+    log_error("socket failed");
     return -1;
   }
     
@@ -60,20 +136,20 @@ int init_socket(uint16_t port)
 
   if (bind(server_socket, reinterpret_cast<sockaddr *>(&server_addr),
 	   sizeof(server_addr)) < 0) {
-    // --> TODO Call syslog here
+    log_error("bind failed");
     close(server_socket);
     return -1;
   }
   
   if (listen(server_socket, SOMAXCONN) != 0) {
-    // --> TODO Call syslog here
+    log_error("listen failed");
     close(server_socket);
     return -1;
   }
 
   // Prevent leaking server_socket into child processes
   if(-1 == fcntl(server_socket, F_SETFD, FD_CLOEXEC)) {
-    // --> TODO Call syslog here but do not fail
+    log_error("fcntl(FD_CLOEXEC) failed");
   }
   
   return 0;
@@ -137,12 +213,18 @@ std::string read_body(int client, ssize_t content_length, std::string body)
 // - read()
 int process_request()
 {
+  if (shutdown_requested) {
+    return 0;
+  }
   struct sockaddr_in client_addr;
   socklen_t addrlen = sizeof client_addr;
 
   int client = accept(server_socket, (struct sockaddr *)&client_addr, &addrlen);
   if(client < 0) {
-    // --> TODO Call syslog here
+    if (shutdown_requested || errno == EINTR || errno == EBADF) {
+      return 0;
+    }
+    log_error("accept failed");
     return -1;
   }
   
@@ -220,22 +302,66 @@ int main(int argc, char **argv)
   // --> TODO If command-line parameter is provided, treat it as the
   // --> port number. (Make sure it is != 0.) Otherwise, use the
   // --> default port number.
+  uint16_t port = DEFAULT_PORT;
+  if (argc > 2) {
+    print_usage(argv[0], "Error: too many arguments.");
+    return EXIT_FAILURE;
+  }
+
+  if (argc == 1) {
+    port = DEFAULT_PORT;
+  } else if (argc == 2) {
+    const char *port_str = argv[1];
+    if (port_str == nullptr || *port_str == '\0') {
+      print_usage(argv[0], "Error: port must be a positive integer.");
+      return EXIT_FAILURE;
+    }
+
+    errno = 0;
+    char *end = nullptr;
+    unsigned long parsed = std::strtoul(port_str, &end, 10);
+    if (errno != 0 || end == port_str || *end != '\0' || parsed == 0 || parsed > 65535) {
+      print_usage(argv[0], "Error: port must be a positive integer.");
+      return EXIT_FAILURE;
+    }
+
+    port = static_cast<uint16_t>(parsed);
+  }
   
   // --> TODO Insert code here that creates
   // --> $(PSIRVER_HOME)/psirver.pid
+  if (!create_pid_file()) {
+    return EXIT_FAILURE;
+  }
 
   // --> TODO Insert code here that registers a graceful shutdown
   // --> handler on SIGINT
+  struct sigaction sa{};
+  sa.sa_handler = handle_sigint;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;
+  sigaction(SIGINT, &sa, nullptr);
+  sigaction(SIGTERM, &sa, nullptr);
 
-  init_socket(DEFAULT_PORT);
+  init_socket(port);
   if(server_socket < 0) {
     return EXIT_FAILURE;
   }
     
   while(true) { // Not really, but close
-    process_request(); 
+    if (shutdown_requested) {
+      break;
+    }
+    process_request();
+    if (shutdown_requested) {
+      break;
+    }
   }
 
-  close(server_socket);
+  if (server_socket >= 0) {
+    close(server_socket);
+  }
+  syslog(LOG_NOTICE, "Psirver shutting down on SIGINT");
+  remove_pid_file();
   return EXIT_SUCCESS;
 }
