@@ -16,6 +16,7 @@
 
 // Configuration options and other constants
 static constexpr uint16_t DEFAULT_PORT = 8000;
+static constexpr uint16_t MAX_PORT = 65535;
 static constexpr ssize_t MAX_REQUEST_SZ = 0x10000;
 static constexpr size_t BUFFER_SZ = 4096;
 static constexpr char HEADER_END[] = "\r\n\r\n";
@@ -63,13 +64,13 @@ bool create_pid_file()
 {
   const char *psirver_home = std::getenv("PSIRVER_HOME");
   if (psirver_home == nullptr || *psirver_home == '\0') {
-    std::cerr << "Error: PSIRVER_HOME is not set." << std::endl;
+    std::cerr << "Error: PSIRVER_HOME is not set or is empty." << std::endl;
     return false;
   }
 
   struct stat st;
   if (stat(psirver_home, &st) != 0 || !S_ISDIR(st.st_mode)) {
-    std::cerr << "Error: PSIRVER_HOME directory does not exist." << std::endl;
+    std::cerr << "Error: PSIRVER_HOME directory does not exist: " << strerror(errno) << std::endl;
     return false;
   }
 
@@ -83,7 +84,7 @@ bool create_pid_file()
 
   int fd = open(pid_file_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd < 0) {
-    std::cerr << "Error: could not create PID file." << std::endl;
+    std::cerr << "Error: could not create PID file: " << strerror(errno) << std::endl;
     return false;
   }
 
@@ -149,7 +150,7 @@ int init_socket(uint16_t port)
 
   // Prevent leaking server_socket into child processes
   if(-1 == fcntl(server_socket, F_SETFD, FD_CLOEXEC)) {
-    log_error("fcntl(FD_CLOEXEC) failed");
+    syslog(LOG_NOTICE, "fcntl(FD_CLOEXEC) failed: %s", strerror(errno));
   }
   
   return 0;
@@ -164,19 +165,32 @@ ssize_t parse_content_length(int client, std::string headers)
   constexpr char CL[] = "Content-Length: ";
   size_t pos = headers.find(CL);
   if (pos == std::string::npos) {
-    reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
-    return -1;
+    // Try lowercase
+    pos = headers.find("content-length: ");
+    if (pos == std::string::npos) {
+      reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
+      return -1;
+    }
   }
   
   std::string rest = headers.substr(pos + sizeof CL - 1);
-  size_t content_length_end = rest.find("\n");
+  size_t content_length_end = rest.find("\r");
   if (content_length_end == std::string::npos) {
-    reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
-    return -1;
+    content_length_end = rest.find("\n");
+  }
+  if (content_length_end == std::string::npos) {
+    // No newline found, use rest of string
+    content_length_end = rest.length();
   }
   
-  std::string content_length_str = headers.substr(pos + sizeof CL - 1,
-						  content_length_end);
+  std::string content_length_str = rest.substr(0, content_length_end);
+  // Trim any whitespace
+  size_t start = content_length_str.find_first_not_of(" \t\r\n");
+  size_t end = content_length_str.find_last_not_of(" \t\r\n");
+  if (start != std::string::npos && end != std::string::npos) {
+    content_length_str = content_length_str.substr(start, end - start + 1);
+  }
+  
   size_t content_length = std::stoi(content_length_str);
   
   if (content_length > MAX_REQUEST_SZ) {
@@ -253,15 +267,14 @@ int process_request()
   if(request.compare(0, strlen("GET "), "GET ") == 0) {
     std::string headers = request.substr(0, header_end_pos);
 
-    Request *rq = Request::make_get_request(headers);
-    /*
+    Request *rq = Request::make_get_request(client, headers);
     if(rq == nullptr) {
-      reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
+      // Error already sent by make_get_request
       return -1;
     }
-    */
     
-    reply(client, "HTTP/1.1 200 OK", "Hello from Psirver!");
+    rq->execute();
+    delete rq;
     return 0;
   }
 
@@ -277,15 +290,14 @@ int process_request()
     std::string body = request.substr(header_end_pos + sizeof HEADER_END - 1);
     body = read_body(client, content_length, body);
 
-    Request *rq = Request::make_post_request(headers, body);
-    /*
+    Request *rq = Request::make_post_request(client, headers, body);
     if(rq == nullptr) {
-      reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
+      // Error already sent by make_post_request
       return -1;
     }
-    */
     
-    reply(client, "HTTP/1.1 200 OK", "Hello from Psirver!");
+    rq->execute();
+    delete rq;
     return 0;
   }
   
@@ -298,10 +310,7 @@ int process_request()
 // - close()
 int main(int argc, char **argv)
 {
-
-  // --> TODO If command-line parameter is provided, treat it as the
-  // --> port number. (Make sure it is != 0.) Otherwise, use the
-  // --> default port number.
+  // Parse port number from command line or use default
   uint16_t port = DEFAULT_PORT;
   if (argc > 2) {
     print_usage(argv[0], "Error: too many arguments.");
@@ -320,7 +329,7 @@ int main(int argc, char **argv)
     errno = 0;
     char *end = nullptr;
     unsigned long parsed = std::strtoul(port_str, &end, 10);
-    if (errno != 0 || end == port_str || *end != '\0' || parsed == 0 || parsed > 65535) {
+    if (errno != 0 || end == port_str || *end != '\0' || parsed == 0 || parsed > MAX_PORT) {
       print_usage(argv[0], "Error: port must be a positive integer.");
       return EXIT_FAILURE;
     }
@@ -328,14 +337,12 @@ int main(int argc, char **argv)
     port = static_cast<uint16_t>(parsed);
   }
   
-  // --> TODO Insert code here that creates
-  // --> $(PSIRVER_HOME)/psirver.pid
+  // Create PID file in PSIRVER_HOME
   if (!create_pid_file()) {
     return EXIT_FAILURE;
   }
 
-  // --> TODO Insert code here that registers a graceful shutdown
-  // --> handler on SIGINT
+  // Register graceful shutdown handler for SIGINT and SIGTERM
   struct sigaction sa{};
   sa.sa_handler = handle_sigint;
   sigemptyset(&sa.sa_mask);
