@@ -11,8 +11,6 @@
 static constexpr ssize_t MAX_REQUEST_SZ = 0x10000;
 
 static constexpr size_t READ_BUFFER_SZ = 0x1000;
-static constexpr char RN[] = "\r\n";
-static constexpr char END_OF_HEADER[] = "\r\n\r\n";
 
 // Global variables (are evil)
 int server_socket;
@@ -177,6 +175,11 @@ Task *request2task()
 
     Task *task = Task::construct(client, headers);
 
+    if(!task) {
+      reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
+      return nullptr;
+    }
+    
     // TODO: move messaging to execute()
     reply(client, "HTTP/1.1 200 OK", "Hello from Psirver!");
     return task;
@@ -195,6 +198,11 @@ Task *request2task()
     body = read_body(client, content_length, body);
 
     Task *task = Task::construct(client, headers, body);    
+    if(!task) {
+      reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
+      return nullptr;
+    }
+
     // TODO: move messaging to execute()
     reply(client, "HTTP/1.1 200 OK", "Hello from Psirver!");
     return task;

@@ -4,6 +4,9 @@
 #include <vector>
 #include <unistd.h>
 
+static constexpr char RN[] = "\r\n";
+static constexpr char END_OF_HEADER[] = "\r\n\r\n";
+
 void reply(int client, const char *status_line, const char *body);
 
 class Task {
@@ -21,8 +24,11 @@ public:
 
   virtual int execute() = 0;	// Execute the task
   
-  static Task *construct(int client, std::string headers); // GET
-  static Task *construct(int client, std::string headers, std::string body); // POST
+  static Task *construct(int client,
+			 const std::string& headers); // GET
+  static Task *construct(int client,
+			 const std::string& headers,
+			 const std::string& body); // POST
 }; 
 
 class HealthTask : public Task { // GET /health

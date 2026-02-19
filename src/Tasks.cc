@@ -1,107 +1,80 @@
 #include "Tasks.hh"
 
+// Do the job, reply to the client, and return to the main loop
+
 int HealthTask::execute()
 {
-  // --> Implement later
+  // --> To be implemented later
+  std::cerr << "I will report health\n";
   return 0;
 }
  
 int TeapotTask::execute()
 {
-  // --> Implement later
+  // --> To be implemented later
+  std::cerr << "I am a teapot (maybe)\n";
   return 0;
 }
 
 int StderrTask::execute()
 {
-  // --> Implement later
+  // --> To be implemented later
+  std::cerr << "I will report stderr of job " << job_id << "\n";
   return 0;
 }
 
 int DeleteTask::execute()
 {
-  // --> Implement later
+  // --> To be implemented later
+  std::cerr << "I will delete script " << script_id << "\n";
   return 0;
 }
 
 int RunTask::execute()
 {
-  // --> Implement later
+  // --> To be implemented later
+  std::cerr << "I will run script " << script_id << "\n";
   return 0;
 }
 
 int JobStatusTask::execute()
 {
-  // --> Implement later
+  // --> To be implemented later
+  std::cerr << "I will report status of job " << job_id << "\n";
   return 0;
 };
 
 int TerminateTask::execute()
 {
-  // --> Implement later
+  // --> To be implemented later
+  std::cerr << "I will terminate job " << job_id << "\n";
   return 0;
 }
 
 int StdoutTask::execute()
 {
-  // --> Implement later
+  // --> To be implemented later
+  std::cerr << "I will report stdout of job " << job_id << "\n";
   return 0;
 } 
 
 int UploadTask::execute()
 {
-  // --> Implement later
+  // --> To be implemented later
+  std::cerr << "I will upload file " << filename << "; script length " << script.size() << "\n";
   return 0;
 }
 
 int ScriptListTask::execute()
 {
-  // --> Implement later
+  // --> To be implemented later
+  std::cerr << "I will report list of scripts\n";
   return 0;
 }
 
 int JobListTask::execute()
 {
-  // --> Implement later
+  // --> To be implemented later
+  std::cerr << "I will report list of jobs\n";
   return 0;
 }
-
-// This function parses the headers and returns one of the GET task
-// objects
-Task *Task::construct(int /*client*/, std::string headers)
-{
-  // --> Implement & remove debug printout
-  std::cerr << "GET" << std::endl; // DEBUG
-  std::cerr << "Headers:\n" << headers << std::endl; // DEBUG
-  
-  // Return a new Task
-  return nullptr;
-}
-
-// This function parses the headers and the body returns one of the
-// POST task objects
-Task *Task::construct(int /*client*/, std::string headers, std::string body)
-{
-  // Content-Type: application/x-www-form-urlencoded
-  // Body:
-  // ......data.........
-
-  // or (note that the boundary is the same in all three places):
-
-  // Content-Type: multipart/form-data; boundary=------------------------67c1112af97a18b9
-  // Body: 
-  // --------------------------67c1112af97a18b9
-  // Content-Disposition: form-data; name="file"; filename="Makefile"
-  // Content-Type: application/octet-stream
-  // ......data.........
-  // --------------------------67c1112af97a18b9--
-
-  // --> Implement & remove debug printout
-  std::cerr << "POST" << std::endl; // DEBUG
-  std::cerr << "Headers:\n" << headers << std::endl; // DEBUG
-  std::cerr << "Body:\n" << body << std::endl; // DEBUG
-  
-  // Return a new Task
-  return nullptr;
-}
-
