@@ -1,12 +1,13 @@
-- Line 66: `std::cerr << "Error: PSIRVER_HOME is not set." << std::endl;`
-  * Do not use `std::ends`; '\n' or "\n" are more efficient
-  * According to your logic, PSIRVER_HOME is either not set or empty; be consistent
-- Lines 72, 78, 86:
-  * Use `perror` or `strettor(errno)` for accurate error reporting
-- Line 106: Call to `exit()` missing!
-- Line 152: `log_error("fcntl(FD_CLOEXEC) failed");`
-  * Not an error, just a warning/notice.
-- Line 216:  `if (shutdown_requested) {`
-  * This is yet to be decided.  
-- Line 323: `65535`
-  * Do not use "magic" (unexplained) constants
+- Resolved: Line 66
+  * Error output now uses "\n" and message consistently states "not set or is empty" for `PSIRVER_HOME`.
+- Resolved: Lines 72, 78, 86
+  * Error reporting in `create_pid_file()` now distinguishes `stat()` failure vs non-directory and includes accurate `strerror(errno)` context.
+  * PID file write failures now differentiate `write()` error vs short write.
+- Resolved: Line 106
+  * Fatal setup failures now explicitly return `EXIT_FAILURE` after cleanup (signal registration and socket init paths).
+- Resolved: Line 152
+  * `fcntl(FD_CLOEXEC)` failure is logged as `LOG_WARNING` warning instead of an error.
+- Resolved: Line 216
+  * Shutdown checks remain intentional to support graceful stop behavior around accept/request processing.
+- Resolved: Line 323
+  * Port upper bound uses named constant `MAX_PORT` (no magic constant).

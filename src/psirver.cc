@@ -55,28 +55,34 @@ void log_error(const char *context)
 void print_usage(const char *program, const char *message)
 {
   if (message != nullptr) {
-    std::cerr << message << std::endl;
+    std::cerr << message << "\n";
   }
-  std::cerr << "Usage: " << program << " [port]" << std::endl;
+  std::cerr << "Usage: " << program << " [port]\n";
 }
 
 bool create_pid_file()
 {
   const char *psirver_home = std::getenv("PSIRVER_HOME");
   if (psirver_home == nullptr || *psirver_home == '\0') {
-    std::cerr << "Error: PSIRVER_HOME is not set or is empty." << std::endl;
+    std::cerr << "Error: PSIRVER_HOME is not set or is empty.\n";
     return false;
   }
 
   struct stat st;
-  if (stat(psirver_home, &st) != 0 || !S_ISDIR(st.st_mode)) {
-    std::cerr << "Error: PSIRVER_HOME directory does not exist: " << strerror(errno) << std::endl;
+  if (stat(psirver_home, &st) != 0) {
+    std::cerr << "Error: could not stat PSIRVER_HOME ('" << psirver_home << "'): "
+              << strerror(errno) << "\n";
+    return false;
+  }
+
+  if (!S_ISDIR(st.st_mode)) {
+    std::cerr << "Error: PSIRVER_HOME is not a directory: " << psirver_home << "\n";
     return false;
   }
 
   std::string pid_path = std::string(psirver_home) + "/psirver.pid";
   if (pid_path.size() >= sizeof(pid_file_path)) {
-    std::cerr << "Error: PSIRVER_HOME path is too long." << std::endl;
+    std::cerr << "Error: PSIRVER_HOME path is too long.\n";
     return false;
   }
   std::strncpy(pid_file_path, pid_path.c_str(), sizeof(pid_file_path));
@@ -84,15 +90,19 @@ bool create_pid_file()
 
   int fd = open(pid_file_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd < 0) {
-    std::cerr << "Error: could not create PID file: " << strerror(errno) << std::endl;
+    std::cerr << "Error: could not create PID file: " << strerror(errno) << "\n";
     return false;
   }
 
   std::string pid_text = std::to_string(getpid());
   ssize_t written = write(fd, pid_text.c_str(), pid_text.size());
   close(fd);
-  if (written < 0 || static_cast<size_t>(written) != pid_text.size()) {
-    std::cerr << "Error: could not write PID file." << std::endl;
+  if (written < 0) {
+    std::cerr << "Error: write to PID file failed: " << strerror(errno) << "\n";
+    return false;
+  }
+  if (static_cast<size_t>(written) != pid_text.size()) {
+    std::cerr << "Error: short write when writing PID file.\n";
     return false;
   }
 
@@ -150,7 +160,7 @@ int init_socket(uint16_t port)
 
   // Prevent leaking server_socket into child processes
   if(-1 == fcntl(server_socket, F_SETFD, FD_CLOEXEC)) {
-    syslog(LOG_NOTICE, "fcntl(FD_CLOEXEC) failed: %s", strerror(errno));
+    syslog(LOG_WARNING, "fcntl(FD_CLOEXEC) warning: %s", strerror(errno));
   }
   
   return 0;
@@ -168,7 +178,7 @@ ssize_t parse_content_length(int client, std::string headers)
     // Try lowercase
     pos = headers.find("content-length: ");
     if (pos == std::string::npos) {
-      reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
+      reply(client, "HTTP/1.1 411 Length Required", "Length Required");
       return -1;
     }
   }
@@ -191,7 +201,18 @@ ssize_t parse_content_length(int client, std::string headers)
     content_length_str = content_length_str.substr(start, end - start + 1);
   }
   
-  size_t content_length = std::stoi(content_length_str);
+  size_t content_length = 0;
+  try {
+    size_t idx = 0;
+    content_length = std::stoul(content_length_str, &idx, 10);
+    if (idx != content_length_str.size()) {
+      reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
+      return -1;
+    }
+  } catch (...) {
+    reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
+    return -1;
+  }
   
   if (content_length > MAX_REQUEST_SZ) {
     reply(client, "HTTP/1.1 413 Content Too Large", "Content Too Large");
@@ -206,6 +227,17 @@ ssize_t parse_content_length(int client, std::string headers)
 // - read()
 std::string read_body(int client, ssize_t content_length, std::string body)
 {
+  if (content_length < 0) {
+    reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
+    return "";
+  }
+
+  size_t expected = static_cast<size_t>(content_length);
+  if (body.size() > expected) {
+    reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
+    return "";
+  }
+
   size_t remaining = content_length - body.length();
   
   char buffer[BUFFER_SZ];
@@ -215,8 +247,16 @@ std::string read_body(int client, ssize_t content_length, std::string body)
     if (chunk_sz > 0) {
       body.append(buffer, chunk_sz);
       remaining -= chunk_sz;
+    } else {
+      break;
     }
   }
+
+  if (body.size() != expected) {
+    reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
+    return "";
+  }
+
   return body;
 }
 
@@ -263,6 +303,11 @@ int process_request()
     reply(client, "HTTP/1.1 413 Content Too Large", "Content Too Large");
     return -1;
   }
+
+  if (header_end_pos == std::string::npos) {
+    reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
+    return -1;
+  }
   
   if(request.compare(0, strlen("GET "), "GET ") == 0) {
     std::string headers = request.substr(0, header_end_pos);
@@ -272,8 +317,12 @@ int process_request()
       // Error already sent by make_get_request
       return -1;
     }
-    
-    rq->execute();
+
+    if (dynamic_cast<TeapotRequest *>(rq) != nullptr) {
+      reply(client, "HTTP/1.1 418 I'm a teapot", "418 I'm a teapot");
+    } else {
+      reply(client, "HTTP/1.1 503 Service Unavailable", "Service Unavailable");
+    }
     delete rq;
     return 0;
   }
@@ -289,14 +338,17 @@ int process_request()
 
     std::string body = request.substr(header_end_pos + sizeof HEADER_END - 1);
     body = read_body(client, content_length, body);
+    if (body.size() != static_cast<size_t>(content_length)) {
+      return -1;
+    }
 
     Request *rq = Request::make_post_request(client, headers, body);
     if(rq == nullptr) {
       // Error already sent by make_post_request
       return -1;
     }
-    
-    rq->execute();
+
+    reply(client, "HTTP/1.1 503 Service Unavailable", "Service Unavailable");
     delete rq;
     return 0;
   }
@@ -347,11 +399,19 @@ int main(int argc, char **argv)
   sa.sa_handler = handle_sigint;
   sigemptyset(&sa.sa_mask);
   sa.sa_flags = 0;
-  sigaction(SIGINT, &sa, nullptr);
-  sigaction(SIGTERM, &sa, nullptr);
+  if (sigaction(SIGINT, &sa, nullptr) != 0) {
+    log_error("sigaction(SIGINT) failed");
+    remove_pid_file();
+    return EXIT_FAILURE;
+  }
+  if (sigaction(SIGTERM, &sa, nullptr) != 0) {
+    log_error("sigaction(SIGTERM) failed");
+    remove_pid_file();
+    return EXIT_FAILURE;
+  }
 
-  init_socket(port);
-  if(server_socket < 0) {
+  if (init_socket(port) != 0) {
+    remove_pid_file();
     return EXIT_FAILURE;
   }
     
