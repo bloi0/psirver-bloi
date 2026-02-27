@@ -230,7 +230,7 @@ Request *Request::make_get_request(int client, std::string headers)
         return new JobStatusRequest(client, id);
       }
 
-      reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+      reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
       return nullptr;
     }
     else {
@@ -239,7 +239,7 @@ Request *Request::make_get_request(int client, std::string headers)
       std::string subpath = rest.substr(slash_pos);
       int id = -1;
       if (!parse_strict_id(id_str, id)) {
-        reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+        reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
         return nullptr;
       }
 
@@ -253,7 +253,7 @@ Request *Request::make_get_request(int client, std::string headers)
         return new StderrRequest(client, id);
       }
       else {
-        reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+        reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
         return nullptr;
       }
     }
@@ -265,7 +265,7 @@ Request *Request::make_get_request(int client, std::string headers)
     
     if (slash_pos == std::string::npos) {
       // /scripts/<id> without /delete - not a valid GET endpoint
-      reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+      reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
       return nullptr;
     }
     else {
@@ -278,18 +278,18 @@ Request *Request::make_get_request(int client, std::string headers)
           return new DeleteRequest(client, id);
         }
 
-        reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+        reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
         return nullptr;
       }
       else {
-        reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+        reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
         return nullptr;
       }
     }
   }
   else {
     // Unknown path
-    reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+    reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
     return nullptr;
   }
   
@@ -363,14 +363,14 @@ Request *Request::make_post_request(int client, std::string headers, std::string
     size_t slash_pos = rest.find('/');
     
     if (slash_pos == std::string::npos || rest.substr(slash_pos) != "/run") {
-      reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+      reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
       return nullptr;
     }
 
     std::string id_str = rest.substr(0, slash_pos);
     int id = -1;
     if (!parse_strict_id(id_str, id)) {
-      reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+      reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
       return nullptr;
     }
     
@@ -388,7 +388,7 @@ Request *Request::make_post_request(int client, std::string headers, std::string
     RunRequest *task = new RunRequest(client, headers, body);
     if (task->id < 0) {
       delete task;
-      reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+      reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
       return nullptr;
     }
 
@@ -396,7 +396,7 @@ Request *Request::make_post_request(int client, std::string headers, std::string
   }
   else {
     // Unknown POST path
-    reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+    reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
     return nullptr;
   }
   

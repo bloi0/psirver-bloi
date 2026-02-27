@@ -11,6 +11,10 @@
 #include <csignal>
 #include <limits.h>
 #include <iostream>
+#include <sys/wait.h>
+#include <map>
+#include <vector>
+#include <sstream>
 
 #include "Requests.hh"
 
@@ -21,10 +25,155 @@ static constexpr ssize_t MAX_REQUEST_SZ = 0x10000;
 static constexpr size_t BUFFER_SZ = 4096;
 static constexpr char HEADER_END[] = "\r\n\r\n";
 
+struct ScriptRecord {
+  int id;
+  std::string filename;
+  std::string path;
+};
+
+enum class JobState {
+  RUNNING,
+  COMPLETED,
+  TERMINATED,
+  FAILED
+};
+
+struct JobRecord {
+  int id;
+  int script_id;
+  pid_t pid;
+  int exit_code;
+  JobState state;
+  std::string stdout_path;
+  std::string stderr_path;
+};
+
 // Global server socket
 int server_socket = -1;
 static char pid_file_path[PATH_MAX];
 static volatile sig_atomic_t shutdown_requested = 0;
+static int next_script_id = 1;
+static int next_job_id = 1;
+static std::map<int, ScriptRecord> scripts;
+static std::map<int, JobRecord> jobs;
+
+static std::string get_psirver_home()
+{
+  const char *psirver_home = std::getenv("PSIRVER_HOME");
+  if (psirver_home == nullptr || *psirver_home == '\0') {
+    return ".";
+  }
+  return psirver_home;
+}
+
+static std::string sanitize_filename(const std::string &name)
+{
+  std::string out;
+  out.reserve(name.size());
+  for (char c : name) {
+    if ((c >= 'a' && c <= 'z') ||
+        (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9') ||
+        c == '.' || c == '_' || c == '-') {
+      out.push_back(c);
+    } else {
+      out.push_back('_');
+    }
+  }
+  if (out.empty()) {
+    out = "script.py";
+  }
+  return out;
+}
+
+static bool write_text_file(const std::string &path, const std::string &content)
+{
+  int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) {
+    return false;
+  }
+  ssize_t written = write(fd, content.data(), content.size());
+  close(fd);
+  return written >= 0 && static_cast<size_t>(written) == content.size();
+}
+
+static std::string read_text_file(const std::string &path)
+{
+  std::string result;
+  int fd = open(path.c_str(), O_RDONLY);
+  if (fd < 0) {
+    return result;
+  }
+
+  char buffer[BUFFER_SZ];
+  ssize_t n = 0;
+  while ((n = read(fd, buffer, sizeof(buffer))) > 0) {
+    result.append(buffer, n);
+  }
+  close(fd);
+  return result;
+}
+
+static std::vector<std::string> split_args(const std::string &raw)
+{
+  std::vector<std::string> out;
+  if (raw.empty()) {
+    return out;
+  }
+
+  std::stringstream ss(raw);
+  std::string token;
+  while (std::getline(ss, token, ',')) {
+    out.push_back(token);
+  }
+  return out;
+}
+
+static const char *state_to_cstr(JobState state)
+{
+  switch (state) {
+  case JobState::RUNNING:
+    return "running";
+  case JobState::COMPLETED:
+    return "completed";
+  case JobState::TERMINATED:
+    return "terminated";
+  case JobState::FAILED:
+    return "failed";
+  }
+  return "failed";
+}
+
+static void refresh_job(JobRecord &job)
+{
+  if (job.state != JobState::RUNNING) {
+    return;
+  }
+
+  int status = 0;
+  pid_t res = waitpid(job.pid, &status, WNOHANG);
+  if (res == 0) {
+    return;
+  }
+  if (res < 0) {
+    job.state = JobState::FAILED;
+    return;
+  }
+
+  if (WIFEXITED(status)) {
+    job.exit_code = WEXITSTATUS(status);
+    job.state = (job.exit_code == 0) ? JobState::COMPLETED : JobState::FAILED;
+    return;
+  }
+
+  if (WIFSIGNALED(status)) {
+    job.exit_code = 128 + WTERMSIG(status);
+    job.state = JobState::TERMINATED;
+    return;
+  }
+
+  job.state = JobState::FAILED;
+}
 
 // Reply to the client with an HTTP status line and a human-readable
 // response body
@@ -318,8 +467,84 @@ int process_request()
       return -1;
     }
 
-    if (dynamic_cast<TeapotRequest *>(rq) != nullptr) {
+    if (dynamic_cast<HealthRequest *>(rq) != nullptr) {
+      reply(client, "HTTP/1.1 200 OK", "OK");
+    } else if (dynamic_cast<TeapotRequest *>(rq) != nullptr) {
       reply(client, "HTTP/1.1 418 I'm a teapot", "418 I'm a teapot");
+    } else if (dynamic_cast<ListRequest *>(rq) != nullptr) {
+      std::string body;
+      for (std::map<int, JobRecord>::iterator it = jobs.begin(); it != jobs.end(); ++it) {
+        refresh_job(it->second);
+        body += std::to_string(it->first);
+        body += ":";
+        body += state_to_cstr(it->second.state);
+        body += "\n";
+      }
+      if (body.empty()) {
+        body = "\n";
+      }
+      reply(client, "HTTP/1.1 200 OK", body.c_str());
+    } else if (dynamic_cast<ListScriptsRequest *>(rq) != nullptr) {
+      std::string body;
+      for (std::map<int, ScriptRecord>::iterator it = scripts.begin(); it != scripts.end(); ++it) {
+        body += std::to_string(it->first);
+        body += ":";
+        body += it->second.filename;
+        body += "\n";
+      }
+      if (body.empty()) {
+        body = "\n";
+      }
+      reply(client, "HTTP/1.1 200 OK", body.c_str());
+    } else if (JobStatusRequest *r = dynamic_cast<JobStatusRequest *>(rq)) {
+      std::map<int, JobRecord>::iterator it = jobs.find(r->id);
+      if (it == jobs.end()) {
+        reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+      } else {
+        refresh_job(it->second);
+        std::string body = std::string("id=") + std::to_string(it->second.id) +
+                           " status=" + state_to_cstr(it->second.state);
+        reply(client, "HTTP/1.1 200 OK", body.c_str());
+      }
+    } else if (TerminateRequest *r = dynamic_cast<TerminateRequest *>(rq)) {
+      std::map<int, JobRecord>::iterator it = jobs.find(r->id);
+      if (it == jobs.end()) {
+        reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+      } else {
+        refresh_job(it->second);
+        if (it->second.state == JobState::RUNNING) {
+          kill(it->second.pid, SIGTERM);
+          refresh_job(it->second);
+        }
+        reply(client, "HTTP/1.1 200 OK", "OK");
+      }
+    } else if (StdoutRequest *r = dynamic_cast<StdoutRequest *>(rq)) {
+      std::map<int, JobRecord>::iterator it = jobs.find(r->id);
+      if (it == jobs.end()) {
+        reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+      } else {
+        refresh_job(it->second);
+        std::string body = read_text_file(it->second.stdout_path);
+        reply(client, "HTTP/1.1 200 OK", body.c_str());
+      }
+    } else if (StderrRequest *r = dynamic_cast<StderrRequest *>(rq)) {
+      std::map<int, JobRecord>::iterator it = jobs.find(r->id);
+      if (it == jobs.end()) {
+        reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+      } else {
+        refresh_job(it->second);
+        std::string body = read_text_file(it->second.stderr_path);
+        reply(client, "HTTP/1.1 200 OK", body.c_str());
+      }
+    } else if (DeleteRequest *r = dynamic_cast<DeleteRequest *>(rq)) {
+      std::map<int, ScriptRecord>::iterator it = scripts.find(r->id);
+      if (it == scripts.end()) {
+        reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+      } else {
+        unlink(it->second.path.c_str());
+        scripts.erase(it);
+        reply(client, "HTTP/1.1 200 OK", "OK");
+      }
     } else {
       reply(client, "HTTP/1.1 503 Service Unavailable", "Service Unavailable");
     }
@@ -348,7 +573,73 @@ int process_request()
       return -1;
     }
 
-    reply(client, "HTTP/1.1 503 Service Unavailable", "Service Unavailable");
+    if (UploadRequest *r = dynamic_cast<UploadRequest *>(rq)) {
+      int id = next_script_id++;
+      ScriptRecord rec;
+      rec.id = id;
+      rec.filename = r->filename;
+      rec.path = get_psirver_home() + "/script_" + std::to_string(id) + "_" + sanitize_filename(r->filename);
+      if (!write_text_file(rec.path, r->script)) {
+        reply(client, "HTTP/1.1 500 Internal Server Error", "Internal Server Error");
+      } else {
+        scripts[id] = rec;
+        std::string body_out = std::to_string(id);
+        reply(client, "HTTP/1.1 200 OK", body_out.c_str());
+      }
+    } else if (RunRequest *r = dynamic_cast<RunRequest *>(rq)) {
+      std::map<int, ScriptRecord>::iterator it = scripts.find(r->id);
+      if (it == scripts.end()) {
+        reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+      } else {
+        int job_id = next_job_id++;
+        JobRecord job;
+        job.id = job_id;
+        job.script_id = it->second.id;
+        job.exit_code = -1;
+        job.state = JobState::RUNNING;
+        job.stdout_path = get_psirver_home() + "/job_" + std::to_string(job_id) + ".out";
+        job.stderr_path = get_psirver_home() + "/job_" + std::to_string(job_id) + ".err";
+
+        pid_t pid = fork();
+        if (pid < 0) {
+          reply(client, "HTTP/1.1 500 Internal Server Error", "Internal Server Error");
+          delete rq;
+          return -1;
+        }
+
+        if (pid == 0) {
+          int out_fd = open(job.stdout_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+          int err_fd = open(job.stderr_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+          if (out_fd < 0 || err_fd < 0) {
+            _exit(127);
+          }
+
+          dup2(out_fd, STDOUT_FILENO);
+          dup2(err_fd, STDERR_FILENO);
+          close(out_fd);
+          close(err_fd);
+
+          std::vector<std::string> arg_values = split_args(r->args);
+          std::vector<char *> argv;
+          argv.push_back(const_cast<char *>("python3"));
+          argv.push_back(const_cast<char *>(it->second.path.c_str()));
+          for (size_t i = 0; i < arg_values.size(); ++i) {
+            argv.push_back(const_cast<char *>(arg_values[i].c_str()));
+          }
+          argv.push_back(nullptr);
+
+          execvp("python3", argv.data());
+          _exit(127);
+        }
+
+        job.pid = pid;
+        jobs[job_id] = job;
+        std::string body_out = std::to_string(job_id);
+        reply(client, "HTTP/1.1 200 OK", body_out.c_str());
+      }
+    } else {
+      reply(client, "HTTP/1.1 503 Service Unavailable", "Service Unavailable");
+    }
     delete rq;
     return 0;
   }
