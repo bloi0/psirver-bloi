@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
 set -u
 
-cd /mnt/c/Users/Brennan/psirver-bloi/src || exit 1
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+root_dir="$(cd "$script_dir/.." && pwd)"
+port="${1:-18002}"
+pshome="${2:-/tmp/pshome}"
+log_file="/tmp/psirver${port}.log"
+
+cd "$root_dir" || exit 1
 make -s || exit 1
 
-rm -rf /tmp/pshome
-mkdir -p /tmp/pshome
-export PSIRVER_HOME=/tmp/pshome
+rm -rf "$pshome"
+mkdir -p "$pshome"
+export PSIRVER_HOME="$pshome"
 
-./psirver 18002 >/tmp/psirver18002.log 2>&1 &
+./psirver "$port" >"$log_file" 2>&1 &
 pid=$!
 sleep 1
 if ! kill -0 "$pid" 2>/dev/null; then
   echo "START_FAIL"
-  cat /tmp/psirver18002.log || true
+  cat "$log_file" || true
   exit 1
 fi
 
@@ -23,12 +29,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
-base=http://127.0.0.1:18002
+base="http://127.0.0.1:${port}"
 status_get() { curl -s -o /dev/null -w "%{http_code}" "$1"; }
+body_get() { curl -s "$1"; }
 status_post_form() { curl -s -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/x-www-form-urlencoded" -d "$2" "$1"; }
 
 echo "GET /bad => $(status_get $base/not_a_route)"
-echo "GET /health => $(status_get $base/health)"
+health_body=$(body_get $base/health)
+teapot_body=$(body_get $base/teapot)
+echo "GET /health => $(status_get $base/health) body=$health_body"
+echo "GET /teapot => $(status_get $base/teapot) body=$teapot_body"
+if [ "$health_body" != "Running" ]; then
+  echo "BODY_MISMATCH /health expected=Running got=$health_body"
+fi
+if [ "$teapot_body" != "Running" ]; then
+  echo "BODY_MISMATCH /teapot expected=Running got=$teapot_body"
+fi
 echo "GET /jobs => $(status_get $base/jobs)"
 echo "GET /jobs/<bad_id> => $(status_get $base/jobs/abc)"
 echo "GET /jobs/<id>/<bad_command> => $(status_get $base/jobs/1/nope)"
@@ -43,7 +59,7 @@ echo "POST /scripts/<bad_id>/run => $(status_post_form $base/scripts/abc/run "ar
 echo "POST /scripts/<id>/<bad_command> => $(status_post_form $base/scripts/1/nope "args=")"
 echo "POST /scripts/<id>/run/ => $(status_post_form $base/scripts/1/run/ "args=")"
 
-up_resp=$(curl -s -w "\n%{http_code}" -X POST -F "file=@test_hello.py" "$base/scripts/upload")
+up_resp=$(curl -s -w "\n%{http_code}" -X POST -F "file=@testdata/test_hello.py" "$base/scripts/upload")
 up_body=$(echo "$up_resp" | head -n 1)
 up_code=$(echo "$up_resp" | tail -n 1)
 echo "POST /scripts/upload => $up_code (body=$up_body)"

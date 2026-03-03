@@ -1,20 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-out=/tmp/results18004.txt
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+root_dir="$(cd "$script_dir/.." && pwd)"
+port="${1:-18004}"
+pshome="${2:-/tmp/pshome}"
+out="${3:-/tmp/results${port}.txt}"
+log_file="/tmp/psirver${port}.log"
+
 : > "$out"
 
-cd /mnt/c/Users/Brennan/psirver-bloi/src
+cd "$root_dir"
 make -s
-rm -rf /tmp/pshome && mkdir -p /tmp/pshome
-export PSIRVER_HOME=/tmp/pshome
+rm -rf "$pshome" && mkdir -p "$pshome"
+export PSIRVER_HOME="$pshome"
 
-./psirver 18004 >/tmp/psirver18004.log 2>&1 &
+./psirver "$port" >"$log_file" 2>&1 &
 pid=$!
 sleep 1
 trap 'kill $pid 2>/dev/null || true; wait $pid 2>/dev/null || true' EXIT
 
-base=http://127.0.0.1:18004
+base="http://127.0.0.1:${port}"
 code(){ curl -s -o /dev/null -w "%{http_code}" "$1"; }
 
 printf "GET /health %s\n" "$(code $base/health)" >> "$out"
@@ -33,7 +39,7 @@ printf "POST /scripts/abc/run %s\n" "$(curl -s -o /dev/null -w "%{http_code}" -X
 printf "POST /scripts/1/nope %s\n" "$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/x-www-form-urlencoded" -d "args=" $base/scripts/1/nope)" >> "$out"
 printf "POST /scripts/1/run/ %s\n" "$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/x-www-form-urlencoded" -d "args=" $base/scripts/1/run/)" >> "$out"
 
-up_resp=$(curl -s -w "\n%{http_code}" -X POST -F "file=@test_hello.py" "$base/scripts/upload")
+up_resp=$(curl -s -w "\n%{http_code}" -X POST -F "file=@testdata/test_hello.py" "$base/scripts/upload")
 up_id=$(echo "$up_resp" | head -n 1)
 up_code=$(echo "$up_resp" | tail -n 1)
 printf "POST /scripts/upload %s id=%s\n" "$up_code" "$up_id" >> "$out"

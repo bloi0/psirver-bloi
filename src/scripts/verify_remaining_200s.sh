@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /mnt/c/Users/Brennan/psirver-bloi/src
-make -s
-rm -rf /tmp/pshome && mkdir -p /tmp/pshome
-export PSIRVER_HOME=/tmp/pshome
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+root_dir="$(cd "$script_dir/.." && pwd)"
+port="${1:-18003}"
+pshome="${2:-/tmp/pshome}"
+log_file="/tmp/psirver${port}.log"
 
-./psirver 18003 >/tmp/psirver18003.log 2>&1 &
+cd "$root_dir"
+make -s
+rm -rf "$pshome" && mkdir -p "$pshome"
+export PSIRVER_HOME="$pshome"
+
+./psirver "$port" >"$log_file" 2>&1 &
 pid=$!
 sleep 1
 trap 'kill $pid 2>/dev/null || true; wait $pid 2>/dev/null || true' EXIT
 
-base=http://127.0.0.1:18003
-script_id=$(curl -s -X POST -F "file=@test_hello.py" "$base/scripts/upload")
+base="http://127.0.0.1:${port}"
+script_id=$(curl -s -X POST -F "file=@testdata/test_hello.py" "$base/scripts/upload")
 job_id=$(curl -s -X POST -H "Content-Type: application/x-www-form-urlencoded" -d "args=a,b" "$base/scripts/$script_id/run")
 sleep 1
 
