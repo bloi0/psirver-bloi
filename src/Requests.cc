@@ -127,6 +127,7 @@ UploadRequest::UploadRequest(int client, std::string headers, std::string body) 
   } else {
     this->script = body.substr(data_start);
   }
+  std::cerr << filename << '\n' << script << '\n';
 }
 
 RunRequest::RunRequest(int client, std::string headers, std::string body) {
