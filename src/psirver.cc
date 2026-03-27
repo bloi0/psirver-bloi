@@ -18,6 +18,8 @@
 #include <algorithm>
 #include <dirent.h>
 #include <ctime>
+#include <thread>
+#include <mutex>
 
 #include "Requests.hh"
 
@@ -66,6 +68,7 @@ static int next_script_id = 1;
 static int next_job_id = 1;
 static std::map<int, ScriptRecord> scripts;
 static std::map<int, JobRecord> jobs;
+static std::mutex script_mutex;
 
 static bool parse_positive_id(const std::string &text, int &value)
 {
@@ -342,6 +345,8 @@ static std::vector<ScriptListRecord> scan_scripts_from_disk()
 
 static bool get_script_record(int id, ScriptRecord &record)
 {
+  std::lock_guard<std::mutex> lock(script_mutex);
+
   std::map<int, ScriptRecord>::iterator it = scripts.find(id);
   if (it != scripts.end()) {
     struct stat st;
@@ -558,6 +563,20 @@ void remove_pid_file()
   }
 }
 
+static void cleanup_all_scripts()
+{
+  std::lock_guard<std::mutex> lock(script_mutex);
+
+  for (std::map<int, ScriptRecord>::iterator it = scripts.begin(); it != scripts.end(); ++it) {
+    const ScriptRecord &rec = it->second;
+    std::string script_dir = get_scripts_root() + "/" + std::to_string(rec.id);
+    chmod(script_dir.c_str(), 0700);
+    unlink(rec.path.c_str());
+    rmdir(script_dir.c_str());
+  }
+  scripts.clear();
+}
+
 // Open the main server socket and prepare it for accepting
 // connections. Library functions used:
 // - htonl()/htons()
@@ -699,23 +718,8 @@ std::string read_body(int client, ssize_t content_length, std::string body)
 // failure. Library functions used:
 // - accept()
 // - read()
-int process_request()
+static void handle_client_request(int client)
 {
-  if (shutdown_requested) {
-    return 0;
-  }
-  struct sockaddr_in client_addr;
-  socklen_t addrlen = sizeof client_addr;
-
-  int client = accept(server_socket, (struct sockaddr *)&client_addr, &addrlen);
-  if(client < 0) {
-    if (shutdown_requested || errno == EINTR || errno == EBADF) {
-      return 0;
-    }
-    log_error("accept failed");
-    return -1;
-  }
-  
   char buffer[BUFFER_SZ]; 
   size_t header_end_pos = std::string::npos;
   ssize_t chunk_sz;
@@ -735,12 +739,12 @@ int process_request()
   
   if (request.size() > MAX_REQUEST_SZ) {
     reply(client, "HTTP/1.1 413 Content Too Large", "Content Too Large");
-    return -1;
+    return;
   }
 
   if (header_end_pos == std::string::npos) {
     reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
-    return -1;
+    return;
   }
   
   if(request.compare(0, strlen("GET "), "GET ") == 0) {
@@ -749,7 +753,7 @@ int process_request()
     Request *rq = Request::make_get_request(client, headers);
     if(rq == nullptr) {
       // Error already sent by make_get_request
-      return -1;
+      return;
     }
 
     if (dynamic_cast<HealthRequest *>(rq) != nullptr) {
@@ -758,12 +762,15 @@ int process_request()
       reply(client, "HTTP/1.1 418 I'm a Teapot", "Running");
     } else if (dynamic_cast<ListRequest *>(rq) != nullptr) {
       std::string body;
-      for (std::map<int, JobRecord>::iterator it = jobs.begin(); it != jobs.end(); ++it) {
-        refresh_job(it->second);
-        body += std::to_string(it->first);
-        body += ":";
-        body += state_to_cstr(it->second.state);
-        body += "\n";
+      {
+        std::lock_guard<std::mutex> lock(script_mutex);
+        for (std::map<int, JobRecord>::iterator it = jobs.begin(); it != jobs.end(); ++it) {
+          refresh_job(it->second);
+          body += std::to_string(it->first);
+          body += ":";
+          body += state_to_cstr(it->second.state);
+          body += "\n";
+        }
       }
       if (body.empty()) {
         body = "\n";
@@ -784,43 +791,84 @@ int process_request()
       }
       reply(client, "HTTP/1.1 200 OK", body.c_str());
     } else if (JobStatusRequest *r = dynamic_cast<JobStatusRequest *>(rq)) {
-      std::map<int, JobRecord>::iterator it = jobs.find(r->id);
-      if (it == jobs.end()) {
+      std::string body;
+      bool found = false;
+      {
+        std::lock_guard<std::mutex> lock(script_mutex);
+        std::map<int, JobRecord>::iterator it = jobs.find(r->id);
+        if (it != jobs.end()) {
+          refresh_job(it->second);
+          body = std::string("id=") + std::to_string(it->second.id) +
+                 " status=" + state_to_cstr(it->second.state);
+          found = true;
+        }
+      }
+      if (!found) {
         reply(client, "HTTP/1.1 404 Not Found", "Not Found");
       } else {
-        refresh_job(it->second);
-        std::string body = std::string("id=") + std::to_string(it->second.id) +
-                           " status=" + state_to_cstr(it->second.state);
         reply(client, "HTTP/1.1 200 OK", body.c_str());
       }
     } else if (TerminateRequest *r = dynamic_cast<TerminateRequest *>(rq)) {
-      std::map<int, JobRecord>::iterator it = jobs.find(r->id);
-      if (it == jobs.end()) {
+      bool found = false;
+      pid_t pid_to_kill = -1;
+      {
+        std::lock_guard<std::mutex> lock(script_mutex);
+        std::map<int, JobRecord>::iterator it = jobs.find(r->id);
+        if (it != jobs.end()) {
+          refresh_job(it->second);
+          if (it->second.state == JobState::RUNNING) {
+            pid_to_kill = it->second.pid;
+          }
+          found = true;
+        }
+      }
+      if (!found) {
         reply(client, "HTTP/1.1 404 Not Found", "Not Found");
       } else {
-        refresh_job(it->second);
-        if (it->second.state == JobState::RUNNING) {
-          kill(it->second.pid, SIGTERM);
-          refresh_job(it->second);
+        if (pid_to_kill > 0) {
+          kill(pid_to_kill, SIGTERM);
+          std::lock_guard<std::mutex> lock(script_mutex);
+          std::map<int, JobRecord>::iterator it = jobs.find(r->id);
+          if (it != jobs.end()) {
+            refresh_job(it->second);
+          }
         }
         reply(client, "HTTP/1.1 200 OK", "OK");
       }
     } else if (StdoutRequest *r = dynamic_cast<StdoutRequest *>(rq)) {
-      std::map<int, JobRecord>::iterator it = jobs.find(r->id);
-      if (it == jobs.end()) {
+      std::string stdout_path;
+      bool found = false;
+      {
+        std::lock_guard<std::mutex> lock(script_mutex);
+        std::map<int, JobRecord>::iterator it = jobs.find(r->id);
+        if (it != jobs.end()) {
+          refresh_job(it->second);
+          stdout_path = it->second.stdout_path;
+          found = true;
+        }
+      }
+      if (!found) {
         reply(client, "HTTP/1.1 404 Not Found", "Not Found");
       } else {
-        refresh_job(it->second);
-        std::string body = read_text_file(it->second.stdout_path);
+        std::string body = read_text_file(stdout_path);
         reply(client, "HTTP/1.1 200 OK", body.c_str());
       }
     } else if (StderrRequest *r = dynamic_cast<StderrRequest *>(rq)) {
-      std::map<int, JobRecord>::iterator it = jobs.find(r->id);
-      if (it == jobs.end()) {
+      std::string stderr_path;
+      bool found = false;
+      {
+        std::lock_guard<std::mutex> lock(script_mutex);
+        std::map<int, JobRecord>::iterator it = jobs.find(r->id);
+        if (it != jobs.end()) {
+          refresh_job(it->second);
+          stderr_path = it->second.stderr_path;
+          found = true;
+        }
+      }
+      if (!found) {
         reply(client, "HTTP/1.1 404 Not Found", "Not Found");
       } else {
-        refresh_job(it->second);
-        std::string body = read_text_file(it->second.stderr_path);
+        std::string body = read_text_file(stderr_path);
         reply(client, "HTTP/1.1 200 OK", body.c_str());
       }
     } else if (DeleteRequest *r = dynamic_cast<DeleteRequest *>(rq)) {
@@ -836,7 +884,10 @@ int process_request()
         } else if (rmdir(script_dir.c_str()) != 0) {
           reply(client, "HTTP/1.1 500 Internal Server Error", "Internal Server Error");
         } else {
-          scripts.erase(r->id);
+          {
+            std::lock_guard<std::mutex> lock(script_mutex);
+            scripts.erase(r->id);
+          }
           std::string body_out = std::to_string(r->id);
           reply(client, "HTTP/1.1 200 OK", body_out.c_str());
         }
@@ -845,7 +896,7 @@ int process_request()
       reply(client, "HTTP/1.1 500 Internal Server Error", "Internal Server Error");
     }
     delete rq;
-    return 0;
+    return;
   }
 
   if(request.compare(0, strlen("POST "), "POST ") == 0) {
@@ -854,33 +905,33 @@ int process_request()
     ssize_t content_length = parse_content_length(client, headers);
       
     if (content_length < 0) {
-      return -1;
+      return;
     }
 
     std::string body = request.substr(header_end_pos + sizeof HEADER_END - 1);
     body = read_body(client, content_length, body);
     if (body.size() != static_cast<size_t>(content_length)) {
-      return -1;
+      return;
     }
 
     Request *rq = Request::make_post_request(client, headers, body);
     if(rq == nullptr) {
       // Error already sent by make_post_request
-      return -1;
+      return;
     }
 
     if (UploadRequest *r = dynamic_cast<UploadRequest *>(rq)) {
       if (!ensure_scripts_root()) {
         reply(client, "HTTP/1.1 500 Internal Server Error", "Internal Server Error");
         delete rq;
-        return -1;
+        return;
       }
 
       int id = find_smallest_available_script_id();
       if (id <= 0) {
         reply(client, "HTTP/1.1 500 Internal Server Error", "Internal Server Error");
         delete rq;
-        return -1;
+        return;
       }
 
       ScriptRecord rec;
@@ -889,14 +940,14 @@ int process_request()
       if (rec.filename.empty()) {
         reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
         delete rq;
-        return -1;
+        return;
       }
 
       std::string script_dir = get_scripts_root() + "/" + std::to_string(id);
       if (mkdir(script_dir.c_str(), 0700) != 0) {
         reply(client, "HTTP/1.1 500 Internal Server Error", "Internal Server Error");
         delete rq;
-        return -1;
+        return;
       }
 
       rec.path = script_dir + "/" + rec.filename;
@@ -906,7 +957,10 @@ int process_request()
       } else {
         chmod(rec.path.c_str(), 0400);
         chmod(script_dir.c_str(), 0500);
-        scripts[id] = rec;
+        {
+          std::lock_guard<std::mutex> lock(script_mutex);
+          scripts[id] = rec;
+        }
         std::string body_out = std::to_string(id);
         reply(client, "HTTP/1.1 200 OK", body_out.c_str());
       }
@@ -915,7 +969,11 @@ int process_request()
       if (!get_script_record(r->id, script)) {
         reply(client, "HTTP/1.1 404 Not Found", "Not Found");
       } else {
-        int job_id = next_job_id++;
+        int job_id;
+        {
+          std::lock_guard<std::mutex> lock(script_mutex);
+          job_id = next_job_id++;
+        }
         JobRecord job;
         job.id = job_id;
         job.script_id = script.id;
@@ -928,7 +986,7 @@ int process_request()
         if (pid < 0) {
           reply(client, "HTTP/1.1 500 Internal Server Error", "Internal Server Error");
           delete rq;
-          return -1;
+          return;
         }
 
         if (pid == 0) {
@@ -957,7 +1015,26 @@ int process_request()
         }
 
         job.pid = pid;
-        jobs[job_id] = job;
+        {
+          std::lock_guard<std::mutex> lock(script_mutex);
+          jobs[job_id] = job;
+        }
+
+        int status = 0;
+        if (wait4(pid, &status, 0, nullptr) < 0) {
+          reply(client, "HTTP/1.1 500 Internal Server Error", "Internal Server Error");
+          delete rq;
+          return;
+        }
+
+        {
+          std::lock_guard<std::mutex> lock(script_mutex);
+          std::map<int, JobRecord>::iterator it = jobs.find(job_id);
+          if (it != jobs.end()) {
+            it->second.state = JobState::COMPLETED;
+          }
+        }
+
         std::string body_out = std::to_string(job_id);
         reply(client, "HTTP/1.1 200 OK", body_out.c_str());
       }
@@ -965,12 +1042,34 @@ int process_request()
       reply(client, "HTTP/1.1 500 Internal Server Error", "Internal Server Error");
     }
     delete rq;
-    return 0;
+    return;
   }
   
   reply(client, "HTTP/1.1 405 Method Not Allowed",
 	(request.substr(0, 10) + "...").c_str());
-  return -1;
+  return;
+}
+
+int process_request()
+{
+  if (shutdown_requested) {
+    return 0;
+  }
+
+  struct sockaddr_in client_addr;
+  socklen_t addrlen = sizeof client_addr;
+  int client = accept(server_socket, (struct sockaddr *)&client_addr, &addrlen);
+  if(client < 0) {
+    if (shutdown_requested || errno == EINTR || errno == EBADF) {
+      return 0;
+    }
+    log_error("accept failed");
+    return -1;
+  }
+
+  std::thread worker(handle_client_request, client);
+  worker.detach();
+  return 0;
 }
 
 // The main workhorse. Library functions used:
@@ -1055,6 +1154,7 @@ int main(int argc, char **argv)
     close(server_socket);
   }
   syslog(LOG_NOTICE, "Psirver shutting down on SIGINT");
+  cleanup_all_scripts();
   remove_pid_file();
   return EXIT_SUCCESS;
 }
