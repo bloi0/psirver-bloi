@@ -427,84 +427,158 @@ int RunTask::execute()
 
 int JobStatusTask::execute()
 {
-  // 1. Lock Job::mutex.
-  // 2. Search for job_id in Job::jobs.
-  // 3. If not found, reply 404 Not Found and return.
-  // 4. If found, save a pointer to the corresponding Job.
-  // 5. Unlock Job::mutex.
-  // 6. Call job->get_status() and convert the result to a string:
-  //    RUNNING, FAILED, TERMINATED, TIMED_OUT, OUTPUT_LIMITED,
-  //    or the numeric exit code if the status is FINISHED.
-  // 7. Obtain the corresponding Script with job->get_script().
-  // 8. Build the response body as "script_id,status".
-  // 9. Reply with HTTP/1.1 200 OK and that body.
-  
-  reply(client, "HTTP/1.1 200 OK", "355,FAILED");
+  auto status_to_string = [](JobStatus s, int result) {
+    switch (s) {
+    case JobStatus::RUNNING:
+      return std::string("RUNNING");
+    case JobStatus::FAILED:
+      return std::string("FAILED");
+    case JobStatus::TERMINATED:
+      return std::string("TERMINATED");
+    case JobStatus::TIMED_OUT:
+      return std::string("TIMED_OUT");
+    case JobStatus::OUTPUT_LIMITED:
+      return std::string("OUTPUT_LIMITED");
+    case JobStatus::FINISHED:
+      return std::to_string(result);
+    }
+    return std::string("FAILED");
+  };
+
+  std::string body;
+  {
+    std::lock_guard<std::mutex> lock(Job::mutex);
+    auto it = Job::jobs.find(job_id);
+    if (it == Job::jobs.end() || !it->second) {
+      reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+      return 1;
+    }
+
+    Job* job = it->second.get();
+    Script* script = job->get_script();
+    const std::string status =
+      status_to_string(job->get_status(), job->get_result());
+    const std::size_t script_id = script ? script->get_id() : 0;
+    body = std::to_string(script_id) + "," + status;
+  }
+
+  reply(client, "HTTP/1.1 200 OK", body.c_str());
   return 0;
 
 };
 
 int JobListTask::execute()
 {
-  // 1. Atomically (using Job::mutex):
-  // 2. Iterate over all entries in Job::jobs.
-  // 3. For each entry:
-  //    - obtain the job ID from the map key
-  //    - obtain the Job object
-  //    - obtain the corresponding Script with job->get_script()
-  //    - append one line in the format
-  //      "job_id,script_id,script_name\n"
-  
-  reply(client, "HTTP/1.1 200 OK", "12345,355,missing.py\n");
+  std::string listing;
+
+  {
+    std::lock_guard<std::mutex> lock(Job::mutex);
+    for (const auto& entry : Job::jobs) {
+      const pid_t id = entry.first;
+      const std::unique_ptr<Job>& job_ptr = entry.second;
+
+      if (!job_ptr) {
+        continue;
+      }
+      Script* script = job_ptr->get_script();
+      if (!script) {
+        continue;
+      }
+
+      listing += std::to_string(id);
+      listing += ',';
+      listing += std::to_string(script->get_id());
+      listing += ',';
+      listing += script->get_name();
+      listing += '\n';
+    }
+  }
+
+  reply(client, "HTTP/1.1 200 OK", listing.c_str());
   return 0;
 }
 
 int TerminateTask::execute()
 {
-  // 1. Atomically (using Lock Job::mutex):
-  // 2. Search for job_id in Job::jobs.
-  // 3. If not found, reply 404 Not Found and return.
-  // 4. Call job->terminate() to stop the job.
-  
+  {
+    std::lock_guard<std::mutex> lock(Job::mutex);
+    auto it = Job::jobs.find(job_id);
+    if (it == Job::jobs.end() || !it->second) {
+      reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+      return 1;
+    }
+
+    it->second->terminate();
+  }
+
   reply(client, "HTTP/1.1 200 OK", "OK");
   return 0;
 }
 
 int StderrTask::execute()
 {
-  // 1. Atomically (using Job::mutex):
-  // 2. Search for job_id in Job::jobs.
-  // 3. If not found, reply 404 Not Found and return.
-  // 4. Obtain the job's standard-error output by calling job->get_stderr().
-  
-  reply(client, "HTTP/1.1 200 OK", "Mary had a little lamb");
+  std::string stderr_out;
+
+  {
+    std::lock_guard<std::mutex> lock(Job::mutex);
+    auto it = Job::jobs.find(job_id);
+    if (it == Job::jobs.end() || !it->second) {
+      reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+      return 1;
+    }
+
+    stderr_out = it->second->get_stderr();
+  }
+
+  reply(client, "HTTP/1.1 200 OK", stderr_out.c_str());
   return 0;
 }
 
 int StdoutTask::execute()
 {
-  // 1. Atomically (using Job::mutex):
-  // 2. Search for job_id in Job::jobs.
-  // 3. If not found, reply 404 Not Found and return.
-  // 4. Obtain the job's standard output by calling job->get_stdout().
+  std::string stdout_out;
 
-  reply(client, "HTTP/1.1 200 OK", "Its fleece was white as snow");
+  {
+    std::lock_guard<std::mutex> lock(Job::mutex);
+    auto it = Job::jobs.find(job_id);
+    if (it == Job::jobs.end() || !it->second) {
+      reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+      return 1;
+    }
+
+    stdout_out = it->second->get_stdout();
+  }
+
+  reply(client, "HTTP/1.1 200 OK", stdout_out.c_str());
   return 0;
 }
 
 int PurgeJobTask::execute()
 {
-  // 1. Lock Job::mutex.
-  // 2. Search for job_id in Job::jobs.
-  // 3. If not found, reply 404 Not Found and return.
-  // 4. If found:
-  //    - save a pointer to the corresponding Script
-  //    - move the Job object out of the map into a local std::unique_ptr<Job>
-  //    - erase the map entry
-  // 5. Unlock Job::mutex.
-  // 6. If the removed job is still RUNNING, terminate it.
-  // 8. Decrement script->n_jobs (the variable is "atomic")
-      
+  Script* script = nullptr;
+  std::unique_ptr<Job> removed_job;
+
+  {
+    std::lock_guard<std::mutex> lock(Job::mutex);
+    auto it = Job::jobs.find(job_id);
+    if (it == Job::jobs.end() || !it->second) {
+      reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+      return 1;
+    }
+
+    script = it->second->get_script();
+    removed_job = std::move(it->second);
+    Job::jobs.erase(it);
+  }
+
+  if (removed_job && removed_job->get_status() == JobStatus::RUNNING) {
+    removed_job->terminate();
+  }
+
+  if (script && script->n_jobs > 0) {
+    --script->n_jobs;
+  }
+
   reply(client, "HTTP/1.1 200 OK", "OK");
   return 0;
 }

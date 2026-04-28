@@ -1,0 +1,6 @@
+Jobs.o: Jobs.cc Tasks.hh Jobs.hh
+Requests.o: Requests.cc Requests.hh
+TaskFactory.o: TaskFactory.cc Tasks.hh
+Tasks.o: Tasks.cc utils.hh Tasks.hh Jobs.hh
+psirver.o: psirver.cc utils.hh Tasks.hh Jobs.hh
+utils.o: utils.cc utils.hh
