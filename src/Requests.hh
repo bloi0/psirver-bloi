@@ -2,10 +2,13 @@
 #include <iostream>
 #include <cstring>
 
+class ServerState;
+
 // Do not forget to recycle Requests after handling!
 class Request {
 public:
   virtual ~Request() = default; // Virtual destructor for proper cleanup
+  virtual void handle(ServerState &state) = 0;
   static Request *make_get_request(int client, std::string headers);
   static Request *make_post_request(int client, std::string headers, std::string body);
   
@@ -17,6 +20,7 @@ protected:
 
 class HealthRequest : public Request { // GET /health
 public:
+  void handle(ServerState &state) override;
   HealthRequest(int client)
   {
     std::cout << "DEBUG: HealthRequest constructed" << std::endl;
@@ -26,6 +30,7 @@ public:
 
 class TeapotRequest : public Request { // GET /teapot
 public:
+  void handle(ServerState &state) override;
   TeapotRequest(int client)
   {
     std::cout << "DEBUG: TeapotRequest constructed" << std::endl;
@@ -35,6 +40,7 @@ public:
 
 class ListRequest : public Request { // GET /jobs
 public:
+  void handle(ServerState &state) override;
   ListRequest(int client)
   {
     std::cout << "DEBUG: ListRequest constructed" << std::endl;
@@ -44,6 +50,7 @@ public:
 
 class ListScriptsRequest : public Request { // GET /scripts
 public:
+  void handle(ServerState &state) override;
   ListScriptsRequest(int client)
   {
     std::cout << "DEBUG: ListScriptsRequest constructed" << std::endl;
@@ -53,6 +60,7 @@ public:
 
 class DeleteRequest : public Request { // GET /scripts/<id>/delete
 public:
+  void handle(ServerState &state) override;
   DeleteRequest(int client, int id)
   {
     std::cout << "DEBUG: DeleteRequest constructed" << std::endl;
@@ -64,6 +72,7 @@ public:
 
 class JobStatusRequest : public Request { // GET /jobs/<id>
 public:
+  void handle(ServerState &state) override;
   JobStatusRequest(int client, int id)
   {
     std::cout << "DEBUG: JobStatusRequest constructed" << std::endl;
@@ -75,6 +84,7 @@ public:
 
 class TerminateRequest : public Request { // GET /jobs/<id>/terminate
 public:
+  void handle(ServerState &state) override;
   TerminateRequest(int client, int id)
   {
     std::cout << "DEBUG: TerminateRequest constructed" << std::endl;
@@ -86,6 +96,7 @@ public:
 
 class StdoutRequest : public Request { // GET /jobs/<id>/stdout
 public:
+  void handle(ServerState &state) override;
   StdoutRequest(int client, int id)
   {
     std::cout << "DEBUG: StdoutRequest constructed" << std::endl;
@@ -97,6 +108,7 @@ public:
 
 class StderrRequest : public Request { // GET /jobs/<id>/stderr
 public:
+  void handle(ServerState &state) override;
   StderrRequest(int client, int id)
   {
     std::cout << "DEBUG: StderrRequest constructed" << std::endl;
@@ -108,6 +120,7 @@ public:
 
 class RunRequest : public Request { // POST /scripts/<id>/run + args
 public:
+  void handle(ServerState &state) override;
   RunRequest(int client, std::string headers, std::string body);
   int id;
   std::string args;
@@ -115,6 +128,7 @@ public:
 
 class UploadRequest : public Request { // POST /scripts/upload
 public:
+  void handle(ServerState &state) override;
   UploadRequest(int client, std::string headers, std::string body);
   std::string script;
   std::string filename;

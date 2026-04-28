@@ -1,5 +1,5 @@
 ﻿CXXFLAGS = -std=c++11 -Wall -Wextra -Wpedantic -g -fPIC -fstack-protector-all -pthread
-OBJS = psirver.o Requests.o # More object files can be placed on this line
+OBJS = psirver.o Requests.o RequestHandlers.o ServerState.o # More object files can be placed on this line
 BIN = ./psirver # The main binary
 
 SERVER = http://localhost:8000
